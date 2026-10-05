@@ -1,0 +1,1 @@
+"""Browser-assisted media capture."""

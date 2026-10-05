@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coldvideo-downloader"
+version = "0.1.0"
+description = "Browser-assisted media capture using native CDP breakpoints"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["patchright==1.63.0"]
+
+[project.scripts]
+coldvideo-downloader = "coldvideo_downloader.capture:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

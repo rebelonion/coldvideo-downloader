@@ -1,0 +1,7 @@
+**
+!Dockerfile
+!pyproject.toml
+!README.md
+!src/
+!src/coldvideo_downloader/
+!src/coldvideo_downloader/*.py

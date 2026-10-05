@@ -1,0 +1,12 @@
+/.research/
+/.venv/
+/build/
+/dist/
+/downloads/
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.parts/
+*.m4a
+*.mp4
+*.log
