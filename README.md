@@ -25,10 +25,10 @@ coldvideo-downloader 'https://.../<track-path>' -o track.m4a
 ## Docker
 
 ```sh
-docker build -t coldvideo-downloader .
+docker pull ghcr.io/rebelonion/coldvideo-downloader:latest
 mkdir -p downloads
 docker run --rm --init --shm-size=1g \
   --user "$(id -u):$(id -g)" \
   --mount "type=bind,source=$PWD/downloads,target=/downloads" \
-  coldvideo-downloader 'https://.../<track-path>' -o track.m4a
+  ghcr.io/rebelonion/coldvideo-downloader:latest 'https://.../<track-path>' -o track.m4a
 ```
