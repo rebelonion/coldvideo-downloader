@@ -11,6 +11,7 @@ coldvideo-downloader 'https://.../<track-path>' -o track.m4a
 
 | Option | Behavior |
 | --- | --- |
+| `--rate 4` | Maximum playback rate from 1× to 16×; adapts to buffer availability. |
 | `--grace-seconds 60` | Extra allowance after remaining playback time. |
 | `--max-seconds N` | Explicit playback-time cap across attempts. |
 | `--stall-seconds 45` | Stop when playback and capture remain idle. |

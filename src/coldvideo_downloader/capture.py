@@ -40,6 +40,36 @@ SINKS = {
     "HTMLMediaElement": "HTMLMediaElement.prototype.play",
 }
 MEDIA_SINKS = {"SourceBuffer", "ManagedSourceBuffer", "AudioDecoder", "BaseAudioContext"}
+RATE_JS = """function(requested, expected, total) {
+    let ahead = 0, end = 0;
+    for (let i = 0; i < this.buffered.length; i++) {
+        if (this.buffered.start(i) <= this.currentTime && this.currentTime < this.buffered.end(i)) {
+            end = this.buffered.end(i);
+            ahead = end - this.currentTime;
+            break;
+        }
+    }
+    const complete = total > 0 && end >= total;
+    const low = Math.max(10, requested * 6), high = Math.max(20, requested * 12);
+    let fallback = null, slowdown = null, desired = this.playbackRate;
+    if (!this.ended) {
+        if (this.playbackRate !== expected) fallback = 'player changed playback rate';
+        else if (this.paused || this.readyState < 3) {
+            desired = 1; slowdown = 'playback waiting';
+        } else if (this.playbackRate > 1 && !complete && ahead < low) {
+            desired = 1; slowdown = 'low playback buffer';
+        } else if (this.playbackRate === 1) {
+            if (ahead >= high || complete) desired = requested;
+            else slowdown = 'buffer refilling';
+        }
+    }
+    if (fallback) desired = 1;
+    if (desired !== this.playbackRate) this.playbackRate = desired;
+    if (this.playbackRate !== desired) fallback = 'player rejected playback rate';
+    if (fallback && this.playbackRate !== 1) this.playbackRate = 1;
+    return {actual: this.playbackRate, buffer_seconds: ahead,
+            slowdown_reason: slowdown, fallback_reason: fallback};
+}"""
 
 
 class CaptureError(Exception):
@@ -380,8 +410,71 @@ class SinkTracker:
         return {str(cid): sorted(names) for cid, names in self.active.items()}
 
 
+class PlaybackRate:
+    def __init__(self, requested, fallback_reason=None):
+        self.media = None
+        self.status = {"requested": requested, "actual": 1.0, "buffer_seconds": None,
+                       "accelerated": False, "speedups": 0, "slowdowns": 0,
+                       "slowdown_reason": None, "fallback_reason": fallback_reason}
+
+    async def find_media(self, cdp, contexts):
+        candidates = []
+        try:
+            for cid in list(contexts):
+                prototype = await send(cdp, "Runtime.evaluate", {
+                    "expression": "HTMLMediaElement.prototype", "contextId": cid,
+                    "objectGroup": "rate-discovery"})
+                objects = await send(cdp, "Runtime.queryObjects", {
+                    "prototypeObjectId": prototype["result"]["objectId"], "objectGroup": "rate-discovery"})
+                active = await send(cdp, "Runtime.callFunctionOn", {
+                    "objectId": objects["objects"]["objectId"], "objectGroup": "rate-discovery",
+                    "functionDeclaration": """function(){return this.filter(element=>{
+                        // Heap queries include derived prototypes with invalid media getters.
+                        try{return !element.paused && !element.ended;}catch{return false;}
+                    });}"""})
+                properties = await send(cdp, "Runtime.getProperties", {
+                    "objectId": active["result"]["objectId"], "ownProperties": True})
+                candidates.extend(prop["value"]["objectId"] for prop in properties["result"]
+                                  if prop["name"].isdigit())
+            if len(candidates) != 1:
+                return None
+            retained = await send(cdp, "Runtime.callFunctionOn", {
+                "objectId": candidates[0], "functionDeclaration": "function(){return this;}",
+                "objectGroup": "rate-control"})
+            return retained["result"]["objectId"]
+        finally:
+            await send(cdp, "Runtime.releaseObjectGroup", {"objectGroup": "rate-discovery"})
+
+    async def poll(self, cdp, contexts, total):
+        if self.status["requested"] == 1 or self.status["fallback_reason"]:
+            return
+        if self.media is None:
+            self.media = await self.find_media(cdp, contexts)
+            if self.media is None:
+                return
+        result = await send(cdp, "Runtime.callFunctionOn", {
+            "objectId": self.media, "functionDeclaration": RATE_JS, "returnByValue": True,
+            "arguments": [{"value": self.status["requested"]}, {"value": self.status["actual"]},
+                          {"value": total}]})
+        if "exceptionDetails" in result:
+            raise CaptureError("player rejected playback rate control")
+        before = self.status["actual"]
+        self.status.update(result["result"]["value"])
+        self.status["accelerated"] = self.status["accelerated"] or self.status["actual"] > 1
+        self.status["speedups"] += self.status["actual"] > before
+        self.status["slowdowns"] += self.status["actual"] < before
+        if self.status["actual"] != 1 and (self.status["slowdown_reason"] or self.status["fallback_reason"]):
+            raise CaptureError("could not restore 1x playback")
+        if self.status["fallback_reason"]:
+            print(f"playback rate: 1x ({self.status['fallback_reason']}); acceleration disabled", flush=True)
+        elif self.status["actual"] != before:
+            reason = self.status["slowdown_reason"] or "buffer ready"
+            print(f"playback rate: {self.status['actual']:g}x ({reason}), "
+                  f"{self.status['buffer_seconds']:.1f}s buffered", flush=True)
+
+
 class Session:
-    def __init__(self, args, store, elapsed_playback=0, reconnect=False):
+    def __init__(self, args, store, elapsed_playback=0, reconnect=False, rate_fallback=None):
         self.args = args
         self.store = store
         self.sinks = {}
@@ -402,6 +495,7 @@ class Session:
         self.established = False
         self.disconnected = None
         self.runtime = {}
+        self.rate = PlaybackRate(getattr(args, "rate", 1.0), rate_fallback)
 
     def mark_disconnected(self, cause):
         if not self.closing and self.disconnected is None:
@@ -411,7 +505,7 @@ class Session:
     def result(self, reason):
         return {"reason": reason, "last_seconds": self.last_seconds,
                 "duration": self.duration, "playback_seconds": self.playback_seconds,
-                "runtime": self.runtime, "disconnect_cause": self.disconnected,
+                "runtime": self.runtime, "rate": dict(self.rate.status), "disconnect_cause": self.disconnected,
                 "errors": dict(self.errors), "error_samples": list(self.error_samples)}
 
     def report_error(self, operation, exc, fatal=False):
@@ -631,6 +725,16 @@ class Session:
             print(f"t={now-began:.0f}s prog={text!r} frags={len(self.store.frags)} idle={idle:.0f}s", flush=True)
             if total > 0 and current >= total:
                 return "end"
+            if self.rate.status["requested"] > 1 and not self.rate.status["fallback_reason"]:
+                try:
+                    await self.rate.poll(cdp, self.tracker.contexts, total)
+                except Exception as exc:
+                    self.rate.status["fallback_reason"] = "rate control unavailable"
+                    self.report_error("playback rate", exc)
+                    if self.disconnected:
+                        return "connection_lost"
+                    if self.rate.status["actual"] != 1:
+                        return "capture_error"
             if not advancing and idle > self.args.stall_seconds:
                 return "stalled"
             if advancing and idle > self.args.broken_seconds:
@@ -731,10 +835,13 @@ async def capture(args):
         write_json(store.dir / "status.json", {"complete": False, "verified": False, "reason": "running"})
         attempts = []
         elapsed_playback = 0
+        rate_fallback = None
         for attempt in range(1 if args.no_reconnect else 2):
-            session = Session(args, store, elapsed_playback, reconnect=attempt > 0)
+            session = Session(args, store, elapsed_playback, reconnect=attempt > 0,
+                              rate_fallback=rate_fallback)
             reason = await session.run()
             attempts.append(session.result(reason))
+            rate_fallback = session.rate.status["fallback_reason"]
             elapsed_playback += session.playback_seconds
             if reason != "connection_lost" or session.fatal or args.no_reconnect or attempt == 1:
                 break
@@ -757,7 +864,8 @@ def main():
     parser = argparse.ArgumentParser(prog="coldvideo-downloader", description="Browser-assisted media capture using native CDP breakpoints")
     parser.add_argument("url", help="track/post URL")
     parser.add_argument("-o", "--out", default="coldvideo.m4a")
-    parser.add_argument("--rate", type=float, choices=[1.0], default=1.0, help="passive 1x playback only")
+    parser.add_argument("--rate", type=float, default=1.0,
+                        help="maximum playback rate from 1 to 16; adapts to available buffer")
     start = parser.add_mutually_exclusive_group()
     start.add_argument("--start", type=int, default=0, help="start offset; a tail alone cannot pass full-track validation")
     start.add_argument("--resume", action="store_true", help="replay from zero and reuse saved fragments")
@@ -769,6 +877,8 @@ def main():
     parser.add_argument("--no-verify", action="store_true", help="skip decode checks; timeline validation remains mandatory")
     parser.add_argument("--no-fix", action="store_true", help="publish validated fMP4 without remux")
     args = parser.parse_args()
+    if not math.isfinite(args.rate) or not 1 <= args.rate <= 16:
+        parser.error("rate must be a finite number from 1 to 16")
     if (args.start < 0 or min(args.grace_seconds, args.stall_seconds, args.broken_seconds) <= 0
             or args.max_seconds is not None and args.max_seconds <= 0):
         parser.error("start must be nonnegative and timeouts must be positive")

@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -398,6 +399,21 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         self.session.mark_disconnected('CDP closed')
         self.assertEqual(await self.monitor(healthy=True), 'connection_lost')
 
+    async def test_rate_control_failure_before_acceleration_keeps_passive_capture(self):
+        self.session.rate = h.PlaybackRate(2)
+        self.session.tracker.contexts = {}
+        self.session.rate.poll = AsyncMock(side_effect=RuntimeError('rate unavailable'))
+        self.assertEqual(await self.monitor(healthy=True), 'timeout')
+        self.session.rate.poll.assert_awaited_once()
+        self.assertEqual(self.session.rate.status['fallback_reason'], 'rate control unavailable')
+
+    async def test_rate_control_failure_after_acceleration_stops_capture(self):
+        self.session.rate = h.PlaybackRate(2)
+        self.session.rate.status.update(actual=2, accelerated=True)
+        self.session.tracker.contexts = {}
+        self.session.rate.poll = AsyncMock(side_effect=RuntimeError('cannot control active rate'))
+        self.assertEqual(await self.monitor(healthy=True), 'capture_error')
+
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -412,6 +428,7 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         return json.loads((self.root / 'out.m4a.parts' / 'status.json').read_text())
 
     async def test_single_reconnect_reuses_and_refills_saved_parts(self):
+        self.args.rate = 2
         sessions = []
         async def run(session):
             sessions.append(session)
@@ -420,10 +437,15 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
             if len(sessions) == 1:
                 session.store.add('frag', fragment(2))
                 session.playback_seconds = 10
+                session.rate.status['fallback_reason'] = 'player changed playback rate'
                 session.report_error('scope read', h.BrowserError('Session closed'))
                 session.disconnected = 'CDP closed'
                 return 'connection_lost'
             self.assertTrue(session.reconnect)
+            self.assertEqual(session.rate.status['fallback_reason'], 'player changed playback rate')
+            cdp = Mock()
+            await session.rate.poll(cdp, {}, 4)
+            cdp.send.assert_not_called()
             self.assertEqual(session.elapsed_playback, 10)
             self.assertFalse(session.store.add('frag', fragment(2)))
             session.store.add('frag', fragment(1))
@@ -440,6 +462,25 @@ class ReconnectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([a['reason'] for a in status['attempts']], ['connection_lost', 'end'])
         self.assertEqual(status['playback_seconds'], 14)
         self.assertEqual(status['errors']['scope read'], 1)
+        self.assertEqual(status['attempts'][1]['rate']['requested'], 2)
+        self.assertEqual(status['attempts'][1]['rate']['actual'], 1)
+
+    async def test_buffer_slowdown_does_not_disable_acceleration_after_reconnect(self):
+        self.args.rate = 4
+        sessions = []
+        async def run(session):
+            sessions.append(session)
+            if not session.reconnect:
+                session.rate.status.update(accelerated=True, slowdown_reason='low playback buffer')
+                session.mark_disconnected('CDP closed')
+                return 'connection_lost'
+            self.assertIsNone(session.rate.status['fallback_reason'])
+            self.assertEqual(session.rate.status['requested'], 4)
+            return 'timeout'
+        with patch.object(h.Session, 'run', run):
+            self.assertEqual(await h.capture(self.args), 2)
+        self.assertEqual(len(sessions), 2)
+        self.assertEqual(self.status()['attempts'][0]['rate']['slowdown_reason'], 'low playback buffer')
 
     async def test_second_disconnect_exhausts_retry_and_keeps_parts(self):
         calls = []
@@ -690,6 +731,224 @@ class ChromiumIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 errors.assert_not_called()
             finally:
                 await browser.close()
+
+
+@unittest.skipUnless(shutil.which('google-chrome') and shutil.which('ffmpeg') and shutil.which('ffprobe'),
+                     'Chrome and media tools unavailable')
+class PlaybackRateIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tmp.cleanup)
+        cls.root = Path(cls.tmp.name)
+        source = cls.root / 'source.m4a'
+        subprocess.run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'sine=sample_rate=48000',
+                        '-t', '30', '-c:a', 'aac', '-movflags', '+empty_moov+default_base_moof',
+                        '-frag_duration', '500000', str(source)], check=True, capture_output=True)
+        data = source.read_bytes()
+        cls.source = base64.b64encode(data).decode()
+        chunks = [b'']
+        for kind, payload in h.boxes(data):
+            raw = box(kind, payload)
+            if kind == b'moof':
+                chunks.append(raw)
+            elif kind in (b'ftyp', b'moov', b'mdat'):
+                chunks[-1] += raw
+        cls.chunks = [base64.b64encode(chunk).decode() for chunk in chunks]
+
+    async def asyncSetUp(self):
+        playwright = await h.async_playwright().start()
+        self.addAsyncCleanup(playwright.stop)
+        self.browser = await playwright.chromium.launch(channel='chrome', headless=True)
+        self.addAsyncCleanup(self.browser.close)
+        page = await self.browser.new_page()
+        self.cdp = await page.context.new_cdp_session(page)
+        self.contexts = {}
+        self.cdp.on('Runtime.executionContextCreated', lambda event: self.contexts.update(
+            {event['context']['id']: {}}) if event['context'].get('auxData', {}).get('isDefault') else None)
+        await h.send(self.cdp, 'Runtime.enable')
+
+    async def evaluate(self, expression):
+        result = await h.send(self.cdp, 'Runtime.evaluate', {
+            'expression': expression, 'returnByValue': True, 'awaitPromise': True, 'userGesture': True})
+        self.assertNotIn('exceptionDetails', result)
+        return result['result'].get('value')
+
+    async def play(self):
+        await self.evaluate(f'''globalThis.audio = new Audio('data:audio/mp4;base64,{self.source}');
+            audio.muted = true; audio.play();''')
+        self.assertFalse(await self.evaluate('audio.isConnected'))
+
+    async def seek(self, seconds):
+        await self.evaluate(f'''new Promise(resolve=>{{
+            audio.addEventListener('seeked',resolve,{{once:true}});audio.currentTime={seconds};
+        }})''')
+
+    async def test_detached_audio_slows_down_and_accelerates_after_refilling(self):
+        await self.play()
+        native = await self.evaluate('HTMLMediaElement.prototype.play.toString()')
+        rate = h.PlaybackRate(2)
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(await self.evaluate('audio.playbackRate'), 2)
+        await self.seek(22)
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(rate.status['slowdown_reason'], 'low playback buffer')
+        self.assertIsNone(rate.status['fallback_reason'])
+        self.assertEqual(await self.evaluate('audio.playbackRate'), 1)
+        await self.seek(12)
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(await self.evaluate('audio.playbackRate'), 1)
+        await self.seek(0)
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(await self.evaluate('audio.playbackRate'), 2)
+        self.assertEqual(rate.status['speedups'], 2)
+        self.assertEqual(rate.status['slowdowns'], 1)
+        self.assertEqual(await self.evaluate('HTMLMediaElement.prototype.play.toString()'), native)
+
+    async def test_all_requested_rates_can_finish_a_fully_buffered_tail(self):
+        await self.play()
+        for requested in (1.25, 1.5, 2, 2.75, 4, 8, 16):
+            with self.subTest(rate=requested):
+                await self.evaluate('audio.playbackRate=1;audio.play()')
+                await self.seek(27)
+                rate = h.PlaybackRate(requested)
+                await rate.poll(self.cdp, self.contexts, 30)
+                await rate.poll(self.cdp, self.contexts, 30)
+                self.assertEqual(await self.evaluate('audio.playbackRate'), requested)
+                self.assertIsNone(rate.status['fallback_reason'])
+
+    async def test_player_rate_changes_are_not_repeatedly_overridden(self):
+        await self.play()
+        rate = h.PlaybackRate(1.5)
+        await rate.poll(self.cdp, self.contexts, 100)
+        await self.evaluate('audio.playbackRate=1')
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(rate.status['fallback_reason'], 'player changed playback rate')
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(await self.evaluate('audio.playbackRate'), 1)
+
+    async def test_repeated_high_rate_cycles_wait_for_the_upper_buffer_threshold(self):
+        fixture = await h.send(self.cdp, 'Runtime.evaluate', {'expression': '''(
+            globalThis.bufferEnd=100,
+            {currentTime:0, playbackRate:1, paused:false, ended:false, readyState:4,
+             buffered:{length:1,start:()=>0,end:()=>bufferEnd}}
+        )'''})
+        rate = h.PlaybackRate(8)
+        rate.media = fixture['result']['objectId']
+        await rate.poll(self.cdp, self.contexts, 1000)
+        self.assertEqual(rate.status['actual'], 8)
+        for _ in range(3):
+            await self.evaluate('bufferEnd=40')
+            await rate.poll(self.cdp, self.contexts, 1000)
+            self.assertEqual(rate.status['actual'], 1)
+            self.assertIsNone(rate.status['fallback_reason'])
+            await self.evaluate('bufferEnd=60')
+            await rate.poll(self.cdp, self.contexts, 1000)
+            self.assertEqual(rate.status['actual'], 1)
+            await self.evaluate('bufferEnd=100')
+            await rate.poll(self.cdp, self.contexts, 1000)
+            self.assertEqual(rate.status['actual'], 8)
+        self.assertEqual(rate.status['speedups'], 4)
+        self.assertEqual(rate.status['slowdowns'], 3)
+
+    async def test_high_rate_waits_for_a_larger_real_playback_buffer(self):
+        await self.play()
+        rate = h.PlaybackRate(4)
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(await self.evaluate('audio.playbackRate'), 1)
+        self.assertEqual(rate.status['slowdown_reason'], 'buffer refilling')
+
+    async def test_future_buffer_range_does_not_hide_a_gap(self):
+        fixture = await h.send(self.cdp, 'Runtime.evaluate', {'expression': '''({
+            currentTime:5, playbackRate:1, paused:false, ended:false, readyState:4,
+            buffered:{length:2,start:i=>[0,50][i],end:i=>[8,100][i]}
+        })'''})
+        rate = h.PlaybackRate(2)
+        rate.media = fixture['result']['objectId']
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(rate.status['actual'], 1)
+        self.assertEqual(rate.status['buffer_seconds'], 3)
+        self.assertFalse(rate.status['accelerated'])
+
+    async def test_rejected_acceleration_is_disabled_without_repeated_attempts(self):
+        fixture = await h.send(self.cdp, 'Runtime.evaluate', {'expression': '''({
+            currentTime:0, paused:false, ended:false, readyState:4,
+            buffered:{length:1,start:()=>0,end:()=>40},
+            get playbackRate(){return 1;},set playbackRate(value){}
+        })'''})
+        rate = h.PlaybackRate(2)
+        rate.media = fixture['result']['objectId']
+        await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(rate.status['fallback_reason'], 'player rejected playback rate')
+        with patch.object(h, 'send', AsyncMock()) as send:
+            await rate.poll(self.cdp, self.contexts, 100)
+            send.assert_not_awaited()
+
+    async def test_failed_restore_does_not_claim_one_x_playback(self):
+        fixture = await h.send(self.cdp, 'Runtime.evaluate', {'expression': '''({
+            currentTime:5, paused:false, ended:false, readyState:4,
+            buffered:{length:1,start:()=>0,end:()=>8},
+            get playbackRate(){return 2;},set playbackRate(value){}
+        })'''})
+        rate = h.PlaybackRate(2)
+        rate.media = fixture['result']['objectId']
+        rate.status.update(actual=2, accelerated=True)
+        with self.assertRaisesRegex(h.CaptureError, 'restore 1x'):
+            await rate.poll(self.cdp, self.contexts, 100)
+        self.assertEqual(rate.status['actual'], 2)
+
+    async def test_ambiguous_playing_media_is_not_accelerated(self):
+        await self.play()
+        await self.evaluate(f'''globalThis.other = new Audio('data:audio/mp4;base64,{self.source}');
+            other.muted=true; other.play();''')
+        rate = h.PlaybackRate(2)
+        await rate.poll(self.cdp, self.contexts, 30)
+        self.assertIsNone(rate.media)
+        self.assertEqual(await self.evaluate('[audio.playbackRate,other.playbackRate]'), [1, 1])
+
+    async def test_accelerated_capture_preserves_original_timeline(self):
+        page = self.root / 'player.html'
+        page.write_text('''<button id="player-playpause" class="paused">Play</button>
+            <span id="player-progress-text">0:00 / 0:30</span><script>
+            const audio=new Audio(), media=new MediaSource();audio.muted=true;
+            audio.src=URL.createObjectURL(media);
+            const button=document.getElementById('player-playpause');
+            let append;
+            button.onclick=()=>{audio.play();button.className='';if(append)append();};
+            setInterval(()=>{const t=Math.floor(audio.currentTime);
+                document.getElementById('player-progress-text').innerText=
+                    '0:'+String(t).padStart(2,'0')+' / 0:30';},100);
+            media.addEventListener('sourceopen',()=>{
+                const buffer=media.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+                const chunks=CHUNKS;let index=0;
+                append=()=>{if(index===chunks.length){media.endOfStream();return;}
+                    const bytes=Uint8Array.from(atob(chunks[index++]),c=>c.charCodeAt(0));
+                    buffer.appendBuffer(bytes);};
+                buffer.addEventListener('updateend',append);if(!audio.paused)append();
+            });</script>'''.replace('CHUNKS', json.dumps(self.chunks)))
+        out = self.root / 'captured.m4a'
+        args = SimpleNamespace(url=page.as_uri(), out=str(out), rate=8, resume=False, start=0,
+                               max_seconds=45, grace_seconds=60, broken_seconds=20,
+                               stall_seconds=45, no_verify=False, no_fix=False, no_reconnect=False)
+        log = io.StringIO()
+        with redirect_stdout(log):
+            result = await h.capture(args)
+        self.assertEqual(result, 0, log.getvalue())
+        status = json.loads(out.with_suffix('.m4a.parts').joinpath('status.json').read_text())
+        self.assertTrue(status['verified'])
+        self.assertAlmostEqual(status['media']['end'], 30, delta=0.1)
+        self.assertTrue(status['attempts'][0]['rate']['accelerated'])
+        self.assertEqual(status['attempts'][0]['rate']['actual'], 8)
+
+
+class RateCliTests(unittest.TestCase):
+    def test_unsupported_rates_are_rejected_before_browser_setup(self):
+        for rate in ('0.5', '16.1', '100', 'nan', 'inf'):
+            with self.subTest(rate=rate):
+                result = subprocess.run([sys.executable, '-m', 'coldvideo_downloader', URL,
+                                         '--rate', rate], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('rate must be a finite number from 1 to 16', result.stderr)
 
 
 if __name__ == '__main__':
